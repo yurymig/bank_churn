@@ -1,0 +1,188 @@
+---
+title: "Отчет: стоит ли мало-активных клиентов банка мотивировать использовать больше продуктов?"
+output: html_document
+---
+Представим такую ситуацию: иновационный менеджер банка разработал идею нового продукта, нацеленного на использовани менее активными клиентами чтобы в дальнейшем они перешли в разряд активных. Внедрением такого продукта заинтересовалось руководство. 
+
+Продукт планируется быть глубоко интегрированным в экосистему работы банка, а значит будет иметь необходимость в использовании сразу большим числом клиентов из категории менее активных. 
+
+Нам же предстоит понять, нужно ли удерживать менее активных пользователей (большая ли часть из них покинула банк) и стоит ли приступать к практической разработке продукта вдобавок к основным, что уже имеются у банка, и может ли это оказаться плохой идеей и в перспективе повлиять на отток клиентов. 
+
+Вопрос, на который я постараюсь ответить звучит следующим образом: следует ли добавлять дополнительный продукт пользователем с небольшой активностью?
+
+```{r echo=F, results=F, message=F, warning=F}
+### Загрузка пакетов
+library(RSQLite)
+library(dplyr)
+library(partykit)
+library(caret)
+library(ggplot2)
+library(rpart)
+library(DBI)
+```
+
+
+```{r echo=F}
+### соединяемся с базой данных
+con <- DBI::dbConnect(SQLite(), "BankChurn.db")
+```
+
+
+```{r echo=F}
+### выбираем интересующую нас таблицу, в данном случае - содержащую информацию об оттоке клиентов
+churn = tbl(con, "churn")
+```
+
+### Содержание таблицы
+В нашем случае интересны количество продуктов, активность клиента, и, конечно, покинул ли он банк
+```{r echo=F}
+dbListFields(con, "churn")
+```
+
+```{r echo=F}
+### Достаем интересующие нас данные
+result <- dbGetQuery(con, "SELECT Exited, NumOfProducts, IsActiveMember FROM churn")
+```
+
+### Посмотрим на распределение интересующей характеристики - количество продуктов
+Можно заметить, что все клиенты банка используют минимум один продукт, значит, для удобства можно поделить данные в бинарный формат 1 (больше 1 продукта) и 0 (1 продукт), так как при внедрении нового продукта большое количество мало-активных клиентов станут пользоваться более чем одним продуктом
+```{r echo=F}
+ggplot(result) + geom_bar(aes(x=NumOfProducts)) + ylab("Количество") + xlab("Количество используемых продуктов") + theme_minimal()
+```
+
+```{r echo=F}
+### Достаем интересующие нас данные, попутно преобразовав их для удобства
+bank <- dbGetQuery(con, "SELECT Exited, IsActiveMember,
+                    CASE WHEN NumOfProducts > 1 THEN '1' 
+                    ELSE '0'
+                    END MoreThan1Product
+                    FROM churn")
+```
+
+
+### Посмотрим на менее активных клиентов
+Видно, что отказались от услуг банка в наибольшей степени менее активные клиенты, значит можно посмотреть, влияет ли на их отказ количество продуктов, как и было запланированно ранее
+```{r echo=F}
+ggplot(bank) + geom_bar(aes(x=IsActiveMember, y=Exited), stat = 'identity') + ylab("Количество клиентов покинувших банк") + xlab("Активен ли клиент? 1 - Да, 0 - нет.") + theme_minimal()
+
+bank <- filter(bank, IsActiveMember == '0')
+bank <- select(bank, -IsActiveMember)
+```
+
+
+```{r echo=F}
+### преобразуем все в фактор
+bank$MoreThan1Product = as.factor(bank$MoreThan1Product)
+bank$Exited = as.factor(bank$Exited)
+```
+
+Также лучше узнать более конкретные значения по характеристике покинувших банк клиентов среди мало-активных.
+```{r echo=F}
+all = dbGetQuery(con, "SELECT Exited, COUNT() AS Quantity FROM churn WHERE IsActiveMember = '0' GROUP BY Exited")
+all
+```
+Теперь мы знаем, что клиентов покинувших банк в 3 раза меньше, чем клиентов пользующихся его услугами. Это может пригодиться для применения весов для характеристики, так как выборка несбалансированна.
+
+```{r echo=F}
+### Разделим выборку на тестовую и обучающую
+set.seed(12)
+ind = createDataPartition(bank$Exited, p = 0.8, list = F)
+train = bank[ind,]
+test = bank[-ind,]
+```
+
+### Модели для анализа ситуации до внедрения нового продукта
+Для начала построим модель дерева принятия решений с кросс валидацией и посмотрим на результат предсказания
+```{r echo=F}
+bank <- select(bank, -MoreThan1Product)
+set.seed(12)
+cv<-trainControl(method="cv", number = 5)
+simple_tree <- caret::train(Exited~., method = 'ctree', data = train, trControl=cv)
+predSimple = predict(simple_tree, test)
+confusionMatrix(predSimple, test$Exited)
+```
+Модель вышла крайне плохой, все предсказания в категории 'клиент не покинет банк'. Такая модель нам не подойдет. Вероятно, проблема кроется в несбалансированости выборки. Попробуем решить эту проблему.
+
+
+### Модель с применением весов
+Попробуем применить веса к значению, количество которого гораздо меньше противоположного, в нашем случае это категория клиентов покинувших банк.
+Тут нам пригодится один из предыдущих пунктов. Мы помним, что клиентов покинувших банк в 3 раза меньше, чем оставшихся клиентов. Попробуем увеличить вес переменной в 3 раза.
+```{r echo=F}
+set.seed(12)
+cv$seeds<-simple_tree$control$seeds
+model_weights <- ifelse(train$Exited == "0", 1, 3)
+weighted_tree <- caret::train(Exited~., method = 'ctree', data = train, weights = model_weights)
+predWeight <- predict(weighted_tree, test)
+confusionMatrix(predWeight, test$Exited)
+```
+Результат плохой, аккураси близко к 50%, что равно угадыванию значений случайным образом, сенситивити и спесифисити тоже не впечатляют
+
+### Модель с даун-сэмплингом
+Попробуем еще один метод выравнивания несбалансированной выборки, может, выйдет получить результат лучше. На этот раз попробуем down-sampling.
+```{r echo=F}
+set.seed(12)
+cv_down <- cv
+cv_down$sampling <- "down"
+down_tree <- caret::train(Exited~., method = 'ctree', data = train, trControl = cv_down)
+predDown <- predict(down_tree, test)
+confusionMatrix(predDown, test$Exited)
+```
+Результат остался таким же
+
+В итоге, лучший результат, который нам удалось получить это аккураси и сенситивити в 60% и спесифисити в 70%. В ситуации, что есть сейчас, можно посудить, что менее активные клиенты, пользующиеся одним продуктом, в большинстве своем не покидают банк. Вероятно, не стоит менять эту ситуацию.
+
+Результат довольно плохой, но все же попробуем предсказать результат в том случае, если новый продукт будет разработан и будет использоваться менее активными пользователями.
+
+```{r echo=F, results=F, message=F, warning=F}
+update <- dbGetQuery(con, "SELECT Exited,
+                    CASE WHEN IsActiveMember = 0 THEN NumOfProducts + 1 
+                    ELSE NumOfProducts
+                    END UpdatedProducts
+                    FROM churn")
+
+```
+
+
+```{r echo=F, results=F, message=F, warning=F}
+### Разделим выборку на тестовую и обучающую
+update$UpdatedProducts = as.factor(update$UpdatedProducts)
+update$Exited = as.factor(update$Exited)
+set.seed(12)
+ind_update = createDataPartition(update$Exited, p = 0.8, list = F)
+train_update = update[ind_update,]
+test_update = update[-ind_update,]
+```
+
+### Модель для предсказания оттока после внедрения нового продукта
+Для реализации данной модели добавим каждому мало-активному клиенту дополнительный продукт.  
+```{r echo=F}
+set.seed(12)
+cv<-trainControl(method="cv", number = 5)
+simple_tree_update <- caret::train(Exited~., method = 'ctree', data = train_update, trControl=cv)
+predSimpleUpdate = predict(simple_tree_update, test_update)
+confusionMatrix(predSimpleUpdate, test_update$Exited)
+```
+Модель вышла плохой. 
+Вероятно, проблема кроется в несбалансированости выборки. Попробуем решить эту проблему.
+
+### Модель для предсказания с применением весов
+```{r echo=F}
+set.seed(12)
+cv$seeds<-simple_tree_update$control$seeds
+model_weights_update <- ifelse(train_update$Exited == "0", 1, 4)
+weighted_tree_update <- caret::train(Exited~., method = 'ctree', data = train_update, weights = model_weights_update)
+predWeight_update <- predict(weighted_tree_update, test_update)
+confusionMatrix(predWeight_update, test_update$Exited)
+```
+Результат плохой, аккураси близко к 50%, что равно угадыванию значений случайным образом, сенситивити и спесифисити также не впечатляют
+
+### Выводы 
+Даже если закрыть глаза на то, что результат сопоставим со случайным распределением (50%), можно увидеть, что доля клиентов, покинувших банк увеличилась. Поэтому, можно заключить, что внедрять подобный продукт для мало-активных пользователей не стоит. 
+
+Вероятно, подобные пользователи не заинтересованы в более продвинутом использовании банковских услуг, либо просто не нуждаются в них. Поэтому, попытка перевода их в активную категорию может сделать только хуже. 
+
+##### Однако, качество полученных моделей довольно низкое, а значит ответ на вопрос нельзя дать с максимальной уверенностью.
+
+```{r echo=F, results=F, message=F, warning=F}
+dbDisconnect(con)
+```
